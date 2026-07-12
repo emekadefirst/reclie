@@ -39,6 +39,14 @@ class ZigBuildExt(build_ext):
             # The limited-API import library ships under <base_prefix>/libs.
             cmd.append(f"-Dpython-libs={os.path.join(sys.base_prefix, 'libs')}")
 
+        # On Linux, pin the glibc version so Zig doesn't emit modern relocations
+        # (e.g. DT_RELR / GLIBC_ABI_DT_RELR@2.36) that would make auditwheel
+        # reject the wheel for the manylinux policy. Set via RECLIE_ZIG_TARGET
+        # in the CI environment, e.g. "x86_64-linux-gnu.2.28".
+        target = os.environ.get("RECLIE_ZIG_TARGET")
+        if target:
+            cmd.append(f"-Dtarget={target}")
+
         self.announce(f"running: {' '.join(cmd)}", level=3)
         subprocess.check_call(cmd, cwd=str(HERE))
 
