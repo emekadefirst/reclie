@@ -27,12 +27,11 @@ dependencies = ["certifi"]
 Homepage = "https://github.com/emekadefirst/reclie"
 
 [tool.setuptools]
-# The compiled extension is produced by `zig build` and dropped into the
-# package by setup.py; ship it as package data alongside the Python sources.
+# The compiled extension is produced by `zig build` and placed into the wheel
+# by setup.py's build_ext (into build_lib), so it does NOT need to be listed as
+# package-data — and listing it would wrongly ship a stale platform binary
+# (e.g. a Windows _reclie.pyd) that happens to sit in the source tree.
 packages = ["reclie", "reclie.core", "reclie.utils"]
-
-[tool.setuptools.package-data]
-reclie = ["_reclie.pyd", "_reclie.abi3.so"]
 
 # ---------------------------------------------------------------------------
 # cibuildwheel: build one abi3 wheel per platform (cp311 covers 3.11+).
