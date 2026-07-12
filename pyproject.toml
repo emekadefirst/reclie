@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reclie"
+version = "0.1.0"
+description = "A high-performance async HTTP client with a native Zig core."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Victor Chibuogwu Chukwuemeka" }]
+keywords = ["http", "https", "async", "client", "zig", "tls"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = ["certifi"]
+
+[project.urls]
+Homepage = "https://github.com/VictorChukwuemeka/reclie"
+
+[tool.setuptools]
+# The compiled extension is produced by `zig build` and dropped into the
+# package by setup.py; ship it as package data alongside the Python sources.
+packages = ["reclie", "reclie.core", "reclie.utils"]
+
+[tool.setuptools.package-data]
+reclie = ["_reclie.pyd", "_reclie.abi3.so"]
+
+# ---------------------------------------------------------------------------
+# cibuildwheel: build one abi3 wheel per platform (cp311 covers 3.11+).
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+build = "cp311-*"
+skip = ["*-musllinux*", "*_i686", "*-win32"]
+build-frontend = "build"
+# Zig is installed per-OS by the workflow / before-all; confirm it's visible.
+before-build = "zig version"
+test-command = "python -c \"import reclie; print('reclie', reclie.__all__)\""
+
+[tool.cibuildwheel.linux]
+# manylinux containers don't have Zig; fetch a pinned build into the container.
+before-all = "bash {project}/.github/install-zig.sh"
+environment = { PATH = "/opt/zig:$PATH" }
+# Our .so only references libpython (resolved by the interpreter) — no third
+# party shared libs — so auditwheel has nothing to bundle.
+manylinux-x86_64-image = "manylinux_2_28_x86_64"
+
+[tool.uv.workspace]
+members = [
+    "example",
+]

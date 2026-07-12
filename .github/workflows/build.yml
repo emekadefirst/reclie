@@ -1,0 +1,113 @@
+name: build
+
+# Builds the production (ReleaseFast) abi3 wheels for Linux, Windows and macOS
+# and, on a version tag, publishes them to PyPI.
+#
+# One abi3 wheel per platform serves CPython 3.11+ (the engine targets
+# Py_LIMITED_API 3.11).
+#
+# Dry runs: use the "Run workflow" button (workflow_dispatch). It builds wheels
+# (and sdist) but never publishes, and you can pick a single OS to iterate fast
+# on the riskier platforms (macOS/Linux).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "OS to build (dry run)"
+        default: all
+        type: choice
+        options: [all, ubuntu-latest, windows-latest, macos-latest]
+
+env:
+  # Keep these in sync when bumping Zig. The sha256 is for the x86_64 Linux
+  # tarball (the only Linux arch we build) from ziglang.org/download.
+  ZIG_VERSION: "0.16.0"
+  ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+
+jobs:
+  # Decide the OS matrix: all three, or the single one chosen for a dry run.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.pick.outputs.os }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          choice="${{ github.event.inputs.os }}"
+          if [ -n "$choice" ] && [ "$choice" != "all" ]; then
+            echo "os=[\"$choice\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest","windows-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  wheels:
+    name: wheels (${{ matrix.os }})
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.setup.outputs.os) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zig for the runner host — used directly by the Windows/macOS builds.
+      # (Linux builds happen in manylinux containers and install Zig via
+      # .github/install-zig.sh in cibuildwheel's before-all.)
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          # Forward the pinned Zig version + checksum into the Linux container
+          # so install-zig.sh can fetch and verify the matching build.
+          CIBW_ENVIRONMENT_PASS_LINUX: "ZIG_VERSION ZIG_SHA256"
+          ZIG_VERSION: ${{ env.ZIG_VERSION }}
+          ZIG_SHA256: ${{ env.ZIG_SHA256 }}
+          # macOS: build for Apple Silicon. Add macos-13 to the matrix and set
+          # "x86_64 arm64" to also target Intel.
+          CIBW_ARCHS_MACOS: arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build sdist
+        run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    # Tag pushes only — never on a dry run / PR / branch push.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write # OIDC trusted publishing (no API token needed)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

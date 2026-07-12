@@ -1,0 +1,7 @@
+# Ship the Zig sources + build script in the sdist so a source build can run
+# `zig build` (requires Zig on the build machine).
+include build.zig
+recursive-include src *.zig *.c
+include LICENSE README.md
+# Do not ship prebuilt binaries in the sdist.
+recursive-exclude reclie *.pyd *.so

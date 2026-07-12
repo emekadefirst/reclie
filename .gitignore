@@ -1,2 +1,15 @@
 .zig-cache/
+zig-out/
 __pycache__/
+
+# Build / packaging outputs
+build/
+dist/
+wheelhouse/
+*.egg-info/
+build.log
+
+# Built native engine (produced by `zig build`, shipped only inside wheels)
+reclie/_reclie.pyd
+reclie/_reclie.abi3.so
+reclie/_reclie*.so
