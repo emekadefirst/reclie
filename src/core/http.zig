@@ -54,6 +54,7 @@ pub fn writeRequest(
     port: u16,
     headers: []const Header,
     body: []const u8,
+    keep_alive: bool,
 ) std.mem.Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -74,7 +75,10 @@ pub fn writeRequest(
     }
     try buf.appendSlice(allocator, "\r\n");
 
-    try buf.appendSlice(allocator, "Connection: close\r\n");
+    try buf.appendSlice(allocator, if (keep_alive)
+        "Connection: keep-alive\r\n"
+    else
+        "Connection: close\r\n");
 
     // Caller headers — track whether they set User-Agent / Content-Length
     // so we don't duplicate them.
@@ -374,7 +378,7 @@ pub const Http2Engine = struct {
 
 test "writeRequest: minimal GET" {
     const allocator = std.testing.allocator;
-    const out = try writeRequest(allocator, .GET, "/products", "example.com", 443, &.{}, &.{});
+    const out = try writeRequest(allocator, .GET, "/products", "example.com", 443, &.{}, &.{}, false);
     defer allocator.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "GET /products HTTP/1.1\r\n") != null);
@@ -386,16 +390,24 @@ test "writeRequest: minimal GET" {
 
 test "writeRequest: includes port for non-default" {
     const allocator = std.testing.allocator;
-    const out = try writeRequest(allocator, .GET, "/", "localhost", 8080, &.{}, &.{});
+    const out = try writeRequest(allocator, .GET, "/", "localhost", 8080, &.{}, &.{}, false);
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Host: localhost:8080\r\n") != null);
+}
+
+test "writeRequest: keep-alive sends the keep-alive header" {
+    const allocator = std.testing.allocator;
+    const out = try writeRequest(allocator, .GET, "/", "example.com", 443, &.{}, &.{}, true);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Connection: keep-alive\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Connection: close\r\n") == null);
 }
 
 test "writeRequest: POST with JSON body adds Content-Length" {
     const allocator = std.testing.allocator;
     const headers = [_]Header{.{ .name = "Content-Type", .value = "application/json" }};
     const body = "{\"a\":1}";
-    const out = try writeRequest(allocator, .POST, "/items", "api.example.com", 443, &headers, body);
+    const out = try writeRequest(allocator, .POST, "/items", "api.example.com", 443, &headers, body, false);
     defer allocator.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "POST /items HTTP/1.1") != null);
@@ -410,7 +422,7 @@ test "writeRequest: respects caller's User-Agent and Content-Length" {
         .{ .name = "User-Agent", .value = "custom/1.0" },
         .{ .name = "Content-Length", .value = "0" },
     };
-    const out = try writeRequest(allocator, .POST, "/", "h", 80, &headers, "ignored-body");
+    const out = try writeRequest(allocator, .POST, "/", "h", 80, &headers, "ignored-body", false);
     defer allocator.free(out);
 
     // Default User-Agent should NOT be added when caller already set one.

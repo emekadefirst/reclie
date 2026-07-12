@@ -14,9 +14,47 @@ import json as _json
 from typing import Any, Mapping, Optional, Union
 from urllib.parse import urlencode
 
-from ..utils import RecliResponse, extension
+from ..utils import (
+    ConnectionError,
+    ProtocolError,
+    RecliError,
+    RecliResponse,
+    TimeoutError,
+    TlsError,
+    extension,
+)
 
 __all__ = ["Method", "Headers", "Params", "request"]
+
+# Error-kind ordinals shared with the Zig engine (src/root.zig). 0 == success.
+_ERR_CLASSES = {
+    1: ConnectionError,
+    2: TimeoutError,
+    3: TlsError,
+    4: ProtocolError,
+}
+
+
+def _settle(
+    future: "asyncio.Future[RecliResponse]",
+    status: int,
+    headers: dict,
+    body: bytes,
+    err_kind: int,
+    err_msg: str,
+) -> None:
+    """Resolve ``future`` from the engine callback.
+
+    Scheduled via ``loop.call_soon_threadsafe`` from the Zig I/O thread, so this
+    always runs on the event-loop thread — the only safe place to touch a Future.
+    """
+    if future.cancelled():
+        return
+    if err_kind:
+        exc_cls = _ERR_CLASSES.get(err_kind, RecliError)
+        future.set_exception(exc_cls(err_msg))
+    else:
+        future.set_result(RecliResponse(status, headers, body=body))
 
 Headers = Mapping[str, str]
 Params = Mapping[str, Union[str, int, float, bool]]

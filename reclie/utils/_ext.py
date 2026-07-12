@@ -26,7 +26,7 @@ def extension() -> Any:
     if _ext is not None:
         return _ext
     try:
-        from ... import _reclie  # type: ignore[attr-defined]
+        from .. import _reclie  # type: ignore[attr-defined]
     except ImportError as exc:  # pragma: no cover - depends on build state
         raise ImportError(
             "The reclie native engine (_reclie) is not built. "
