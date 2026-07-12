@@ -1,14 +1,15 @@
 """Benchmark: requests, httpx, aiohttp, http.client, and reclie.
 
-reclie is HTTP-only for now (TLS/HTTP2 pending), so we can't point it at
-https://dummyjson.com yet. To keep the comparison apples-to-apples and
-runnable offline, every client hits a local HTTP/1.1 keep-alive server doing
-the same workload:
+This measures raw client overhead against a local HTTP/1.1 keep-alive server
+(zero network latency), so every client hits the same workload:
 
     1. GET  /products
     2. POST /auth/login   {username, password}
     3. GET  /auth/me
     4. GET  /products/search?q=phone
+
+For a real-network HTTPS comparison (reclie now supports pooled TLS), see
+`example/bench_remote.py`.
 
 Two modes are measured:
   * sequential  - one request at a time over a reused connection/pool

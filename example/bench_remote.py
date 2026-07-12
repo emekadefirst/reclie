@@ -1,8 +1,8 @@
 """Remote HTTPS benchmark against dummyjson.com — reclie vs httpx vs aiohttp.
 
 This is the honest, real-network test (vs the localhost micro-benchmark):
-network latency dominates, and it exposes that reclie currently opens a fresh
-TLS connection per request while httpx/aiohttp reuse a kept-alive one.
+network latency dominates. All three clients now reuse a pooled, kept-alive TLS
+connection, so per-request cost is roughly one round trip.
 
 dummyjson rate-limits (~100 req/window), so counts are kept modest and any
 non-200s are reported. Latency percentiles matter more than throughput here.
