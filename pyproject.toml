@@ -24,7 +24,7 @@ classifiers = [
 dependencies = ["certifi"]
 
 [project.urls]
-Homepage = "https://github.com/VictorChukwuemeka/reclie"
+Homepage = "https://github.com/emekadefirst/reclie"
 
 [tool.setuptools]
 # The compiled extension is produced by `zig build` and dropped into the
@@ -49,9 +49,15 @@ test-command = "python -c \"import reclie; print('reclie', reclie.__all__)\""
 # manylinux containers don't have Zig; fetch a pinned build into the container.
 before-all = "bash {project}/.github/install-zig.sh"
 environment = { PATH = "/opt/zig:$PATH" }
-# Our .so only references libpython (resolved by the interpreter) — no third
-# party shared libs — so auditwheel has nothing to bundle.
-manylinux-x86_64-image = "manylinux_2_28_x86_64"
+# Alias (cibuildwheel appends the arch -> quay.io/pypa/manylinux_2_28_x86_64).
+# auditwheel still runs to retag the wheel manylinux; our .so has no third-party
+# shared libs to bundle (only libpython, resolved by the interpreter).
+manylinux-x86_64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.macos]
+# The extension has no third-party dylibs to bundle and the build already tags
+# the wheel macosx_*; delocate has nothing to do, so skip it.
+repair-wheel-command = ""
 
 [tool.uv.workspace]
 members = [

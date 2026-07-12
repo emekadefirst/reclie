@@ -56,7 +56,11 @@ pub fn build(b: *std.Build) void {
     if (os_tag == .windows) {
         // Windows requires linking the limited-API import library.
         mod.addLibraryPath(.{ .cwd_relative = py_libs });
-        mod.linkSystemLibrary("python3", .{}); // -> python3.lib -> python3.dll
+        // `.use_pkg_config = .no`: without this, Zig may consult a stray
+        // pkg-config on the machine (e.g. Strawberry Perl's on GitHub's Windows
+        // runners) and wrongly link `python3.9`. We just want `python3.lib`
+        // from the path above.
+        mod.linkSystemLibrary("python3", .{ .use_pkg_config = .no }); // -> python3.lib -> python3.dll
     }
 
     const lib = b.addLibrary(.{
