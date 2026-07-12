@@ -1,14 +1,19 @@
-//! Blocking HTTP/1.1 transport with connection pooling and keep-alive.
+//! Blocking HTTP/1.1 transport with connection pooling (plain HTTP) and TLS
+//! (HTTPS).
 //!
 //! Uses the std.Io.Threaded blocking backend so it runs everywhere (Windows
 //! included) today; the io_uring/kqueue/IOCP drivers slot in behind the same
-//! `exchange` seam later. `exchange` borrows a connection from the pool (reusing
-//! an idle keep-alive socket when possible), sends one request, reads exactly
-//! one response using Content-Length / chunked framing, and returns the socket
-//! to the pool if it stays reusable.
+//! `exchange` seam later.
+//!
+//! Plain HTTP reuses pooled keep-alive sockets. HTTPS currently opens a fresh
+//! TLS connection per request (handshake each time) — TLS session reuse is a
+//! follow-up. The request send + response framing is shared by both paths via
+//! `sendAndFrame`, operating on generic `Io.Reader`/`Io.Writer`, which for TLS
+//! are the plaintext streams exposed by `std.crypto.tls.Client`.
 
 const std = @import("std");
 const net = std.Io.net;
+const tls = std.crypto.tls;
 const Pool = @import("pool.zig").Pool;
 
 pub const Error = error{
@@ -17,6 +22,7 @@ pub const Error = error{
     Send,
     Recv,
     Protocol,
+    Tls,
     OutOfMemory,
 };
 
@@ -26,9 +32,12 @@ const Framed = struct {
 };
 
 /// Perform one request against `pool`'s origin, returning the raw response
-/// bytes (owned by `alloc`). Reuses a pooled connection when available and, if
-/// a reused connection turns out to be dead, retries once on a fresh one.
+/// bytes (owned by `alloc`).
 pub fn exchange(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8) Error![]u8 {
+    if (pool.tls) return exchangeTls(pool, alloc, request_bytes);
+
+    // Plain HTTP: reuse a pooled connection, retrying once if a reused socket
+    // turns out to have been closed by the server.
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
         var reused = false;
@@ -46,11 +55,8 @@ pub fn exchange(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8
             },
         }
 
-        const framed = oneRequest(alloc, stream, request_bytes) catch |e| {
+        const framed = onePlainRequest(alloc, stream, request_bytes) catch |e| {
             pool.discard(stream);
-            // A pooled keep-alive socket may have been closed by the server
-            // between requests; that failure isn't the caller's fault, so retry
-            // once on a brand-new connection.
             if (reused and attempt == 0) continue;
             return e;
         };
@@ -60,30 +66,95 @@ pub fn exchange(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8
     }
 }
 
-/// Resolve + connect a new TCP stream. The transient `Io` is only needed during
-/// the call; the returned stream is just a socket handle and outlives it.
+/// HTTPS: fresh TCP + TLS handshake, one request, then close. Not pooled yet.
+fn exchangeTls(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8) Error![]u8 {
+    var t: std.Io.Threaded = .init_single_threaded;
+    const io = t.io();
+
+    var stream = try connectTo(io, pool.host, pool.port);
+    defer stream.close(io);
+
+    const buf_len = tls.Client.min_buffer_len;
+    const net_wbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    defer alloc.free(net_wbuf);
+    const net_rbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    defer alloc.free(net_rbuf);
+    var sw = stream.writer(io, net_wbuf);
+    var sr = stream.reader(io, net_rbuf);
+
+    const tls_wbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    defer alloc.free(tls_wbuf);
+    const tls_rbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    defer alloc.free(tls_rbuf);
+
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+
+    var client = tls.Client.init(&sr.interface, &sw.interface, .{
+        .host = .{ .explicit = pool.host },
+        .ca = .{ .bundle = .{
+            .gpa = alloc,
+            .io = io,
+            .lock = &pool.ca_lock,
+            .bundle = &pool.ca_bundle,
+        } },
+        .write_buffer = tls_wbuf,
+        .read_buffer = tls_rbuf,
+        .entropy = &entropy,
+        .realtime_now = std.Io.Clock.real.now(io),
+    }) catch return error.Tls;
+
+    // The TLS writer's flush drains ciphertext into the net writer's buffer but
+    // does not push it to the socket, so the net writer needs its own flush.
+    const framed = try sendAndFrame(alloc, &client.writer, &client.reader, request_bytes, &sw.interface);
+    client.end() catch {};
+    return framed.raw;
+}
+
+/// Connect a TCP stream to `host:port`. Fast-paths IP literals; otherwise does
+/// a DNS lookup through the OS resolver (`HostName.connect`), which works on
+/// Windows unlike the literal-only `IpAddress.resolve`.
+fn connectTo(io: std.Io, host: []const u8, port: u16) Error!net.Stream {
+    if (net.IpAddress.parse(host, port)) |addr| {
+        return net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.Connect;
+    } else |_| {}
+
+    const hn = net.HostName.init(host) catch return error.Resolve;
+    return hn.connect(io, port, .{ .mode = .stream }) catch return error.Connect;
+}
+
+/// Connect a new plain TCP stream (own transient Io).
 fn openStream(host: []const u8, port: u16) Error!net.Stream {
     var t: std.Io.Threaded = .init_single_threaded;
     const io = t.io();
-    const addr = net.IpAddress.resolve(io, host, port) catch return error.Resolve;
-    return net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.Connect;
+    return connectTo(io, host, port);
 }
 
-/// Send `request_bytes` and read exactly one HTTP/1.1 response.
-fn oneRequest(alloc: std.mem.Allocator, stream: net.Stream, request_bytes: []const u8) Error!Framed {
+fn onePlainRequest(alloc: std.mem.Allocator, stream: net.Stream, request_bytes: []const u8) Error!Framed {
     var t: std.Io.Threaded = .init_single_threaded;
     const io = t.io();
-
-    // Send.
     var wbuf: [8 * 1024]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
-    sw.interface.writeAll(request_bytes) catch return error.Send;
-    sw.interface.flush() catch return error.Send;
-
-    // Receive one framed response.
     var rbuf: [64 * 1024]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
-    const r = &sr.interface;
+    return sendAndFrame(alloc, &sw.interface, &sr.interface, request_bytes, null);
+}
+
+/// Send `request_bytes` on `w` and read exactly one HTTP/1.1 response from `r`.
+/// `w.flush()` is expected to push all the way to the socket (true for both the
+/// net stream writer and the TLS client writer, whose flush drains its output).
+fn sendAndFrame(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    request_bytes: []const u8,
+    /// When `w` is a layered writer (TLS), the underlying transport writer that
+    /// also needs flushing to actually push bytes onto the socket.
+    transport_w: ?*std.Io.Writer,
+) Error!Framed {
+    w.writeAll(request_bytes) catch return error.Send;
+    w.flush() catch return error.Send;
+    if (transport_w) |tw| tw.flush() catch return error.Send;
 
     var raw: std.ArrayList(u8) = .empty;
     errdefer raw.deinit(alloc);
@@ -103,7 +174,6 @@ fn oneRequest(alloc: std.mem.Allocator, stream: net.Stream, request_bytes: []con
 
         if (first_line) {
             first_line = false;
-            // "HTTP/1.0 ..." defaults to close unless keep-alive is requested.
             if (std.mem.startsWith(u8, trimmed, "HTTP/1.0")) http_1_0 = true;
         }
 
@@ -135,7 +205,6 @@ fn oneRequest(alloc: std.mem.Allocator, stream: net.Stream, request_bytes: []con
             const size = std.fmt.parseInt(usize, std.mem.trim(u8, st[0..end], " \t"), 16) catch
                 return error.Protocol;
             if (size == 0) {
-                // Trailer section: read until the terminating blank line.
                 while (true) {
                     const tline = try takeLine(r);
                     try raw.appendSlice(alloc, tline);
@@ -148,7 +217,6 @@ fn oneRequest(alloc: std.mem.Allocator, stream: net.Stream, request_bytes: []con
     } else if (content_length) |cl| {
         try readExactInto(alloc, r, &raw, cl);
     } else {
-        // No framing info: body runs to EOF, connection can't be reused.
         r.appendRemaining(alloc, &raw, .unlimited) catch return error.Recv;
         conn_close = true;
     }

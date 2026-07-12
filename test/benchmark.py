@@ -193,10 +193,10 @@ def run_async_conc(make_client, one_round, rounds: int, concurrency: int) -> flo
 
 def _close(client) -> None:
     for attr in ("close",):
-        fn = getattr(client, attr, None)
-        if callable(fn):
+        function = getattr(client, attr, None)
+        if callable(function):
             try:
-                fn()
+                function()
             except Exception:
                 pass
 

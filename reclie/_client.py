@@ -11,34 +11,26 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .core import Headers, Method, Params, request
-from .utils import RecliResponse, extension
+from .utils import RecliResponse, TlsError, extension
 
 __all__ = ["Client", "Method"]
 
 
-def _default_ca_bundle_bytes() -> bytes:
-    """Read a CA bundle and return its bytes. Tries ``certifi`` first, then
-    ``ssl.get_default_verify_paths().cafile``. Returns ``b""`` if neither is
-    available — Client will then refuse to construct with ``tls=True``."""
-    path: Optional[str] = None
+def _default_ca_bundle_path() -> Optional[str]:
+    """Return a path to a CA bundle file. Tries ``certifi`` first, then
+    ``ssl.get_default_verify_paths().cafile``. Returns ``None`` if neither is
+    available — Client then refuses to construct with ``tls=True``."""
     try:
         import certifi
 
-        path = certifi.where()
+        return certifi.where()
     except ImportError:
         try:
             import ssl
 
-            path = ssl.get_default_verify_paths().cafile
+            return ssl.get_default_verify_paths().cafile
         except Exception:
-            path = None
-    if not path:
-        return b""
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return b""
+            return None
 
 
 class Client:
@@ -48,7 +40,7 @@ class Client:
     alive for the lifetime of your application; do not create one per request.
     """
 
-    __slots__ = ("host", "port", "tls", "version", "pool_size", "ttl", "timeout", "_ca_bundle", "_pool")
+    __slots__ = ("host", "port", "tls", "version", "pool_size", "ttl", "timeout", "_ca_path", "_pool")
 
     def __init__(
         self,
@@ -80,24 +72,37 @@ class Client:
         self.ttl = ttl
         self.timeout = timeout
 
-        # Resolve CA bundle bytes for TLS. Precedence:
-        #   1. Caller-supplied ``ca_bundle`` (raw PEM bytes)
-        #   2. Caller-supplied ``ca_bundle_path`` (file we read)
+        # Resolve a CA bundle *file path* for TLS (the native engine loads it).
+        # Precedence:
+        #   1. Caller-supplied ``ca_bundle_path``
+        #   2. Caller-supplied ``ca_bundle`` (raw PEM bytes -> temp file)
         #   3. ``certifi.where()`` if installed
         #   4. ``ssl.get_default_verify_paths().cafile``
         if not tls:
-            self._ca_bundle = b""
-        elif ca_bundle is not None:
-            self._ca_bundle = ca_bundle
+            self._ca_path = ""
         elif ca_bundle_path is not None:
-            with open(ca_bundle_path, "rb") as f:
-                self._ca_bundle = f.read()
+            self._ca_path = ca_bundle_path
+        elif ca_bundle is not None:
+            import tempfile
+
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="reclie-ca-", suffix=".pem", delete=False
+            )
+            tmp.write(ca_bundle)
+            tmp.close()
+            self._ca_path = tmp.name
         else:
-            self._ca_bundle = _default_ca_bundle_bytes()
+            self._ca_path = _default_ca_bundle_path() or ""
+
+        if tls and not self._ca_path:
+            raise TlsError(
+                "No CA bundle available for TLS. Install `certifi` or pass "
+                "`ca_bundle`/`ca_bundle_path` to Client(...)."
+            )
 
         self._pool = extension().pool_create(
             host, port, tls, version, pool_size, ttl, self._timeout_ms,
-            self._ca_bundle,
+            self._ca_path,
         )
 
     @property

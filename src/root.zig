@@ -131,7 +131,10 @@ fn poolCreate(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const pool_size = PyLong_AsLong(PyTuple_GetItem(args, 4));
     const ttl = PyLong_AsLong(PyTuple_GetItem(args, 5));
     const timeout_ms = PyLong_AsLong(PyTuple_GetItem(args, 6));
-    // arg 7 (ca_bundle) is accepted but unused until the TLS phase.
+
+    // arg 7 is the CA bundle file path (empty string when TLS is disabled).
+    var ca_len: isize = 0;
+    const ca_c = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(args, 7), &ca_len) orelse return null;
 
     // Any of the PyLong_AsLong / IsTrue calls above may have set an error.
     if (PyErr_Occurred() != null) return null;
@@ -145,8 +148,12 @@ fn poolCreate(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         .pool_size = @intCast(pool_size),
         .ttl_seconds = @intCast(ttl),
         .timeout_ms = @intCast(timeout_ms),
-    }) catch {
-        setError("MemoryError", "reclie: failed to allocate connection pool");
+        .ca_path = ca_c[0..@intCast(ca_len)],
+    }) catch |e| {
+        switch (e) {
+            error.OutOfMemory => setError("MemoryError", "reclie: failed to allocate connection pool"),
+            error.CaBundleLoad => setError("RuntimeError", "reclie: failed to load the TLS CA bundle"),
+        }
         return null;
     };
 
@@ -207,11 +214,6 @@ fn submit(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const pool_raw = PyCapsule_GetPointer(PyTuple_GetItem(args, 0), POOL_CAPSULE_NAME) orelse
         return null;
     const pool: *Pool = @ptrCast(@alignCast(pool_raw));
-
-    if (pool.tls) {
-        setError("NotImplementedError", "reclie: HTTPS/TLS is not wired up yet (plain HTTP only)");
-        return null;
-    }
 
     const method_ord = PyLong_AsLong(PyTuple_GetItem(args, 1));
     if (PyErr_Occurred() != null) return null;
@@ -346,6 +348,7 @@ fn worker(ctx: *RequestCtx) void {
             error.Send => finishError(ctx, 1, "failed to send request"),
             error.Recv => finishError(ctx, 1, "connection reset while reading response"),
             error.Protocol => finishError(ctx, 4, "malformed HTTP response framing"),
+            error.Tls => finishError(ctx, 3, "TLS handshake or certificate verification failed"),
             error.OutOfMemory => finishError(ctx, 1, "out of memory reading response"),
         }
         return;

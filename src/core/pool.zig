@@ -13,6 +13,9 @@
 
 const std = @import("std");
 const net = std.Io.net;
+const Certificate = std.crypto.Certificate;
+
+pub const CreateError = std.mem.Allocator.Error || error{CaBundleLoad};
 
 pub const Pool = struct {
     allocator: std.mem.Allocator,
@@ -23,6 +26,12 @@ pub const Pool = struct {
     pool_size: u32,
     ttl_seconds: u32,
     timeout_ms: u32,
+
+    // TLS trust store, loaded once from a PEM file at construction time and
+    // shared (read-only) across concurrent handshakes via `ca_lock`.
+    ca_path: []u8, // owned copy
+    ca_bundle: Certificate.Bundle = .empty,
+    ca_lock: std.Io.RwLock = .init,
 
     /// Atomic spinlock guarding `idle` and `total_open`. Critical sections are
     /// tiny (a push/pop and a counter tweak), and 0.16 removed std.Thread.Mutex
@@ -52,13 +61,17 @@ pub const Pool = struct {
         pool_size: u32,
         ttl_seconds: u32,
         timeout_ms: u32,
+        ca_path: []const u8,
     };
 
-    pub fn create(allocator: std.mem.Allocator, opts: CreateOptions) std.mem.Allocator.Error!*Pool {
+    pub fn create(allocator: std.mem.Allocator, opts: CreateOptions) CreateError!*Pool {
         const self = try allocator.create(Pool);
         errdefer allocator.destroy(self);
 
         const owned_host = try allocator.dupe(u8, opts.host);
+        errdefer allocator.free(owned_host);
+        const owned_ca = try allocator.dupe(u8, opts.ca_path);
+        errdefer allocator.free(owned_ca);
 
         self.* = .{
             .allocator = allocator,
@@ -69,7 +82,19 @@ pub const Pool = struct {
             .pool_size = if (opts.pool_size == 0) 1 else opts.pool_size,
             .ttl_seconds = opts.ttl_seconds,
             .timeout_ms = opts.timeout_ms,
+            .ca_path = owned_ca,
         };
+
+        // Load the trust store up front (once per Client) so handshakes don't
+        // race to build it. Uses a transient blocking Io just for the file read.
+        if (opts.tls and owned_ca.len > 0) {
+            var t: std.Io.Threaded = .init_single_threaded;
+            const tio = t.io();
+            self.ca_bundle.addCertsFromFilePathAbsolute(allocator, tio, std.Io.Clock.real.now(tio), owned_ca) catch {
+                self.ca_bundle.deinit(allocator);
+                return error.CaBundleLoad;
+            };
+        }
         return self;
     }
 
@@ -79,6 +104,8 @@ pub const Pool = struct {
         self.idle.deinit(self.allocator);
 
         const allocator = self.allocator;
+        self.ca_bundle.deinit(allocator);
+        allocator.free(self.ca_path);
         allocator.free(self.host);
         allocator.destroy(self);
     }
@@ -167,6 +194,7 @@ test "pool round-trip" {
         .pool_size = 64,
         .ttl_seconds = 60,
         .timeout_ms = 30_000,
+        .ca_path = "", // no TLS bundle load in this unit test
     });
     defer pool.destroy();
 
