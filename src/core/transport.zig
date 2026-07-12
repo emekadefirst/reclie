@@ -5,11 +5,13 @@
 //! included) today; the io_uring/kqueue/IOCP drivers slot in behind the same
 //! `exchange` seam later.
 //!
-//! Plain HTTP reuses pooled keep-alive sockets. HTTPS currently opens a fresh
-//! TLS connection per request (handshake each time) — TLS session reuse is a
-//! follow-up. The request send + response framing is shared by both paths via
-//! `sendAndFrame`, operating on generic `Io.Reader`/`Io.Writer`, which for TLS
-//! are the plaintext streams exposed by `std.crypto.tls.Client`.
+//! Both plain HTTP and HTTPS reuse pooled keep-alive connections. For TLS, the
+//! whole session (socket + `tls.Client` + its buffers) is kept alive in a
+//! heap-allocated `TlsConn` with stable addresses, so the handshake happens
+//! once per connection rather than once per request. The request send +
+//! response framing is shared by both paths via `sendAndFrame`, operating on
+//! generic `Io.Reader`/`Io.Writer`, which for TLS are the plaintext streams
+//! exposed by `std.crypto.tls.Client`.
 
 const std = @import("std");
 const net = std.Io.net;
@@ -66,31 +68,94 @@ pub fn exchange(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8
     }
 }
 
-/// HTTPS: fresh TCP + TLS handshake, one request, then close. Not pooled yet.
-fn exchangeTls(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8) Error![]u8 {
-    var t: std.Io.Threaded = .init_single_threaded;
-    const io = t.io();
+/// A pooled, persistent TLS connection. Heap-allocated so the reader/writer and
+/// `tls.Client` (which reference each other by pointer via `@fieldParentPtr`)
+/// keep stable addresses across requests. The TLS handshake runs once, in
+/// `openTlsConn`; subsequent requests reuse `client.reader`/`client.writer`.
+const TlsConn = struct {
+    alloc: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    stream: net.Stream,
+    net_wbuf: []u8,
+    net_rbuf: []u8,
+    tls_wbuf: []u8,
+    tls_rbuf: []u8,
+    net_writer: net.Stream.Writer,
+    net_reader: net.Stream.Reader,
+    client: tls.Client,
+};
 
-    var stream = try connectTo(io, pool.host, pool.port);
-    defer stream.close(io);
+/// HTTPS: reuse a pooled TLS session, retrying once on a fresh one if a reused
+/// connection turns out to have been closed by the server.
+fn exchangeTls(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8) Error![]u8 {
+    // Register how the pool should close a TLS connection it evicts.
+    pool.tls_destroy = destroyTlsConn;
+
+    var attempt: u8 = 0;
+    while (true) : (attempt += 1) {
+        var reused = false;
+        var conn: *TlsConn = undefined;
+        switch (pool.acquireTls()) {
+            .reuse => |ptr| {
+                conn = @ptrCast(@alignCast(ptr));
+                reused = true;
+            },
+            .open_new => {
+                conn = openTlsConn(pool, alloc) catch |e| {
+                    pool.releaseReservation();
+                    return e;
+                };
+            },
+        }
+
+        // client.writer.flush() drains ciphertext into the net writer's buffer;
+        // the net writer then needs its own flush to push it onto the socket.
+        const framed = sendAndFrame(
+            alloc,
+            &conn.client.writer,
+            &conn.client.reader,
+            request_bytes,
+            &conn.net_writer.interface,
+        ) catch |e| {
+            pool.discardTls(conn);
+            if (reused and attempt == 0) continue;
+            return e;
+        };
+
+        pool.releaseTls(conn, framed.reusable);
+        return framed.raw;
+    }
+}
+
+/// Open a TCP connection and perform the TLS handshake once.
+fn openTlsConn(pool: *Pool, alloc: std.mem.Allocator) Error!*TlsConn {
+    const conn = alloc.create(TlsConn) catch return error.OutOfMemory;
+    errdefer alloc.destroy(conn);
+
+    conn.alloc = alloc;
+    conn.threaded = .init_single_threaded;
+    const io = conn.threaded.io();
+
+    conn.stream = try connectTo(io, pool.host, pool.port);
+    errdefer conn.stream.close(io);
 
     const buf_len = tls.Client.min_buffer_len;
-    const net_wbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
-    defer alloc.free(net_wbuf);
-    const net_rbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
-    defer alloc.free(net_rbuf);
-    var sw = stream.writer(io, net_wbuf);
-    var sr = stream.reader(io, net_rbuf);
+    conn.net_wbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    errdefer alloc.free(conn.net_wbuf);
+    conn.net_rbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    errdefer alloc.free(conn.net_rbuf);
+    conn.tls_wbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    errdefer alloc.free(conn.tls_wbuf);
+    conn.tls_rbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
+    errdefer alloc.free(conn.tls_rbuf);
 
-    const tls_wbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
-    defer alloc.free(tls_wbuf);
-    const tls_rbuf = alloc.alloc(u8, buf_len) catch return error.OutOfMemory;
-    defer alloc.free(tls_rbuf);
+    conn.net_writer = conn.stream.writer(io, conn.net_wbuf);
+    conn.net_reader = conn.stream.reader(io, conn.net_rbuf);
 
     var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
     io.random(&entropy);
 
-    var client = tls.Client.init(&sr.interface, &sw.interface, .{
+    conn.client = tls.Client.init(&conn.net_reader.interface, &conn.net_writer.interface, .{
         .host = .{ .explicit = pool.host },
         .ca = .{ .bundle = .{
             .gpa = alloc,
@@ -98,17 +163,27 @@ fn exchangeTls(pool: *Pool, alloc: std.mem.Allocator, request_bytes: []const u8)
             .lock = &pool.ca_lock,
             .bundle = &pool.ca_bundle,
         } },
-        .write_buffer = tls_wbuf,
-        .read_buffer = tls_rbuf,
+        .write_buffer = conn.tls_wbuf,
+        .read_buffer = conn.tls_rbuf,
         .entropy = &entropy,
         .realtime_now = std.Io.Clock.real.now(io),
     }) catch return error.Tls;
 
-    // The TLS writer's flush drains ciphertext into the net writer's buffer but
-    // does not push it to the socket, so the net writer needs its own flush.
-    const framed = try sendAndFrame(alloc, &client.writer, &client.reader, request_bytes, &sw.interface);
-    client.end() catch {};
-    return framed.raw;
+    return conn;
+}
+
+/// Close and free a pooled TLS connection (the pool's `tls_destroy` callback).
+fn destroyTlsConn(ptr: *anyopaque) void {
+    const conn: *TlsConn = @ptrCast(@alignCast(ptr));
+    const io = conn.threaded.io();
+    conn.client.end() catch {}; // best-effort close_notify
+    conn.stream.close(io);
+    const a = conn.alloc;
+    a.free(conn.net_wbuf);
+    a.free(conn.net_rbuf);
+    a.free(conn.tls_wbuf);
+    a.free(conn.tls_rbuf);
+    a.destroy(conn);
 }
 
 /// Connect a TCP stream to `host:port`. Fast-paths IP literals; otherwise does

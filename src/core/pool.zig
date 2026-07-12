@@ -40,7 +40,15 @@ pub const Pool = struct {
     lock_flag: std.atomic.Value(bool) = .init(false),
     idle: std.ArrayList(Conn) = .empty,
     /// Connections currently open (idle + in-flight). Never exceeds pool_size.
+    /// A pool is exclusively plain or TLS, so this counts whichever is in use.
     total_open: u32 = 0,
+
+    /// Idle TLS keep-alive connections. Each is an opaque `*TlsConn` owned by
+    /// transport.zig; the pool never inspects it, only stores it and calls
+    /// `tls_destroy` to close it. Keeping it opaque avoids a pool -> transport
+    /// dependency cycle.
+    tls_idle: std.ArrayList(*anyopaque) = .empty,
+    tls_destroy: ?*const fn (*anyopaque) void = null,
 
     const Conn = struct {
         stream: net.Stream,
@@ -50,6 +58,12 @@ pub const Pool = struct {
     /// caller must fill by opening a new connection.
     pub const Acquired = union(enum) {
         reuse: net.Stream,
+        open_new,
+    };
+
+    /// Same as `Acquired`, for the TLS path (opaque connection handles).
+    pub const AcquiredTls = union(enum) {
+        reuse: *anyopaque,
         open_new,
     };
 
@@ -102,6 +116,11 @@ pub const Pool = struct {
         // Close any idle connections before tearing down.
         for (self.idle.items) |c| closeStream(c.stream);
         self.idle.deinit(self.allocator);
+
+        if (self.tls_destroy) |free_conn| {
+            for (self.tls_idle.items) |conn| free_conn(conn);
+        }
+        self.tls_idle.deinit(self.allocator);
 
         const allocator = self.allocator;
         self.ca_bundle.deinit(allocator);
@@ -167,6 +186,45 @@ pub const Pool = struct {
         self.lockMutex();
         self.total_open -= 1;
         self.unlockMutex();
+    }
+
+    // ---- TLS connection pooling (opaque *TlsConn handles) ------------------
+
+    pub fn acquireTls(self: *Pool) AcquiredTls {
+        while (true) {
+            self.lockMutex();
+            if (self.tls_idle.items.len > 0) {
+                const conn = self.tls_idle.items[self.tls_idle.items.len - 1];
+                self.tls_idle.items.len -= 1;
+                self.unlockMutex();
+                return .{ .reuse = conn };
+            }
+            if (self.total_open < self.pool_size) {
+                self.total_open += 1;
+                self.unlockMutex();
+                return .open_new;
+            }
+            self.unlockMutex();
+            std.Thread.yield() catch {};
+        }
+    }
+
+    pub fn releaseTls(self: *Pool, conn: *anyopaque, reusable: bool) void {
+        if (reusable) {
+            self.lockMutex();
+            const ok = self.tls_idle.append(self.allocator, conn);
+            self.unlockMutex();
+            ok catch self.discardTls(conn);
+        } else {
+            self.discardTls(conn);
+        }
+    }
+
+    pub fn discardTls(self: *Pool, conn: *anyopaque) void {
+        self.lockMutex();
+        self.total_open -= 1;
+        self.unlockMutex();
+        if (self.tls_destroy) |free_conn| free_conn(conn);
     }
 
     fn lockMutex(self: *Pool) void {
