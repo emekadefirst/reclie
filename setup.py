@@ -33,6 +33,10 @@ class ZigBuildExt(build_ext):
             "zig",
             "build",
             "-Doptimize=ReleaseFast",
+            # Build for a portable baseline CPU, NOT the build machine's native
+            # CPU. Without this, a CI runner with AVX-512 etc. produces a binary
+            # that crashes with SIGILL / "Illegal instruction" on older CPUs.
+            "-Dcpu=baseline",
             f"-Dpython-include={include_dir}",
         ]
         if sys.platform == "win32":
