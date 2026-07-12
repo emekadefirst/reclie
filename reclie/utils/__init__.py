@@ -13,7 +13,7 @@ from ._exceptions import (
     TlsError,
 )
 from ._ext import extension
-from ._response import RecliHeaders, RecliRespons
+from ._response import RecliHeaders, RecliResponse
 
 __all__ = [
     "extension",

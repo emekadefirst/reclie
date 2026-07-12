@@ -13,7 +13,7 @@ from typing import Any, Iterator, Mapping, Optional, Union
 
 from ._ext import extension
 
-__all__ = ["RecliHeaders", "RecliResponse", "SSEEvent", "WSMessage"]
+__all__ = ["RecliHeaders", "RecliResponse"]
 
 
 class RecliHeaders(Mapping[str, str]):

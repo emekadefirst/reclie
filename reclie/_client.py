@@ -1,16 +1,16 @@
 """The reclie Client facade.
 
-A single, long-lived ``Client`` exposes HTTP, SSE, and WebSocket over one
-connection pool. The Python layer is intentionally thin: each protocol's
-orchestration lives in :mod:`reclie.src.core`; this class just owns the pool
-and dispatches to those engines.
+A single, long-lived ``Client`` exposes HTTP/1.1 and HTTP/2 over one
+connection pool. The Python layer is intentionally thin: request
+orchestration lives in :mod:`reclie.core`; this class just owns the pool and
+dispatches to it. (SSE and WebSocket are deferred to a later phase.)
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from .core import Headers, Method, Params, SSEStream, WSConnect, request
+from .core import Headers, Method, Params, request
 from .utils import RecliResponse, extension
 
 __all__ = ["Client", "Method"]
@@ -42,7 +42,7 @@ def _default_ca_bundle_bytes() -> bytes:
 
 
 class Client:
-    """Origin-bound, reusable async client for HTTP, SSE, and WebSocket.
+    """Origin-bound, reusable async client for HTTP/1.1 and HTTP/2.
 
     Instantiating a ``Client`` allocates the native connection pool. Keep it
     alive for the lifetime of your application; do not create one per request.

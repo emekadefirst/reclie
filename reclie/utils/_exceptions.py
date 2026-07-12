@@ -39,5 +39,9 @@ class TlsError(RecliError):
     """TLS handshake or certificate verification failed."""
 
 
+class ProtocolError(RecliError):
+    """Malformed or unexpected HTTP/1.1 or HTTP/2 response from the server."""
+
+
 class PoolExhaustedError(RecliError):
     """Connection pool is at ``max_size`` with no waiter slot available."""
