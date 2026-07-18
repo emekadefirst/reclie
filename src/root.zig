@@ -21,6 +21,7 @@ const std = @import("std");
 const Pool = @import("core/pool.zig").Pool;
 const http = @import("core/http.zig");
 const transport = @import("core/transport.zig");
+const Dispatch = @import("core/dispatch.zig").Dispatch;
 
 // ---------------------------------------------------------------------------
 // Minimal CPython C-API surface (Py_LIMITED_API, all ABI-stable functions).
@@ -196,12 +197,46 @@ const RequestCtx = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Global request dispatcher — a small, fixed pool of persistent OS threads,
+// started once (lazily, on the first submit()) instead of a thread spawned
+// per request. See dispatch.zig for why.
+// ---------------------------------------------------------------------------
+
+const RequestDispatch = Dispatch(RequestCtx, worker);
+
+var g_dispatch: ?*RequestDispatch = null;
+var g_dispatch_lock: std.atomic.Value(bool) = .init(false);
+
+/// Number of persistent I/O threads. Requests are blocking-socket-bound, not
+/// CPU-bound, so this can comfortably exceed the core count — it just bounds
+/// how many requests are in flight across *all* Clients/Pools in the process
+/// at once. 64 matches `Client`'s default per-origin `pool_size`; tune as
+/// needed once there's a benchmark showing a better number.
+const default_worker_count: u32 = 64;
+
+/// Returns the shared dispatcher, starting it on first use. Guarded by a
+/// spinlock rather than `std.once` (removed in 0.16 alongside Thread.Mutex) —
+/// this only runs once in practice, so a spin is irrelevant to steady-state
+/// perf.
+fn getDispatch() ?*RequestDispatch {
+    if (g_dispatch) |d| return d;
+    while (g_dispatch_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer g_dispatch_lock.store(false, .release);
+    if (g_dispatch) |d| return d; // lost the race to another thread; reuse theirs
+    const d = RequestDispatch.start(std.heap.c_allocator, default_worker_count) catch return null;
+    g_dispatch = d;
+    return d;
+}
+
 /// submit(pool, method, path, headers, body, version, timeout_ms, future, loop) -> 0
 ///
-/// Copies the request into a `RequestCtx`, spawns a detached worker thread to
-/// perform the blocking I/O, and returns immediately. The return value is
-/// unused by the Python caller; we return a fresh int rather than reach for the
-/// `Py_None` data symbol.
+/// Copies the request into a `RequestCtx` and hands it to the shared
+/// dispatcher, which runs it on one of its persistent worker threads. Returns
+/// immediately. The return value is unused by the Python caller; we return a
+/// fresh int rather than reach for the `Py_None` data symbol.
 fn submit(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     _ = self;
     const a = std.heap.c_allocator;
@@ -262,14 +297,20 @@ fn submit(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         .loop = loop,
     };
 
-    const thread = std.Thread.spawn(.{}, worker, .{ctx}) catch {
+    const dispatch = getDispatch() orelse {
         Py_DecRef(future);
         Py_DecRef(loop);
         ctx.destroy();
-        setError("RuntimeError", "reclie: failed to spawn I/O thread");
+        setError("RuntimeError", "reclie: failed to start I/O worker pool");
         return null;
     };
-    thread.detach();
+    dispatch.push(ctx) catch {
+        Py_DecRef(future);
+        Py_DecRef(loop);
+        ctx.destroy();
+        setError("RuntimeError", "reclie: failed to queue request");
+        return null;
+    };
 
     return PyLong_FromLong(0);
 }
