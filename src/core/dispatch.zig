@@ -109,8 +109,23 @@ pub fn Dispatch(comptime Job: type, comptime runJob: fn (*Job) void) type {
                     empty_polls += 1;
                     std.Thread.yield() catch {};
                 } else {
-                    std.Thread.sleep(std.time.ns_per_ms);
+                    // ponytail: std.Thread.sleep and std.time.sleep both
+                    // removed in Zig 0.16; use libc directly (link_libc=true).
+                    shortSleep();
                 }
+            }
+        }
+
+        fn shortSleep() void {
+            if (@import("builtin").os.tag == .windows) {
+                const w = struct {
+                    extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.c) void;
+                };
+                w.Sleep(1);
+            } else {
+                const c = @cImport(@cInclude("time.h"));
+                const ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 1_000_000 };
+                _ = c.nanosleep(&ts, null);
             }
         }
 
